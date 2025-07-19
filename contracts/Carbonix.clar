@@ -24,11 +24,18 @@
 (define-constant err-expired (err u106))
 (define-constant err-unauthorized (err u107))
 (define-constant err-invalid-price (err u108))
+(define-constant err-portfolio-not-found (err u109))
+(define-constant err-portfolio-limit-exceeded (err u110))
+(define-constant err-duplicate-offset (err u111))
+(define-constant err-portfolio-empty (err u112))
+(define-constant err-invalid-weights (err u113))
+(define-constant max-portfolio-size u20)
 
 ;; data vars
 (define-data-var next-offset-id uint u1)
 (define-data-var oracle-address (optional principal) none)
 (define-data-var platform-fee-rate uint u250)
+(define-data-var next-portfolio-id uint u1)
 
 ;; data maps
 (define-map carbon-offsets
@@ -64,6 +71,38 @@
 (define-map user-purchases
   {buyer: principal, offset-id: uint}
   uint
+)
+
+(define-map portfolios
+  uint
+  {
+    owner: principal,
+    name: (string-ascii 64),
+    total-value: uint,
+    created-at: uint,
+    last-rebalanced: uint,
+    is-active: bool
+  }
+)
+
+(define-map portfolio-holdings
+  {portfolio-id: uint, offset-id: uint}
+  {
+    amount: uint,
+    target-weight: uint,
+    purchase-price: uint,
+    added-at: uint
+  }
+)
+
+(define-map portfolio-performance
+  uint
+  {
+    initial-investment: uint,
+    current-value: uint,
+    total-retired: uint,
+    diversification-score: uint
+  }
 )
 
 ;; public functions
@@ -215,6 +254,159 @@
   )
 )
 
+(define-public (create-portfolio (name (string-ascii 64)))
+  (let
+    (
+      (portfolio-id (var-get next-portfolio-id))
+      (current-height stacks-block-height)
+    )
+    (asserts! (> (len name) u0) err-invalid-amount)
+    
+    (map-set portfolios portfolio-id
+      {
+        owner: tx-sender,
+        name: name,
+        total-value: u0,
+        created-at: current-height,
+        last-rebalanced: current-height,
+        is-active: true
+      }
+    )
+    
+    (map-set portfolio-performance portfolio-id
+      {
+        initial-investment: u0,
+        current-value: u0,
+        total-retired: u0,
+        diversification-score: u0
+      }
+    )
+    
+    (var-set next-portfolio-id (+ portfolio-id u1))
+    (ok portfolio-id)
+  )
+)
+
+(define-public (add-to-portfolio (portfolio-id uint) (offset-id uint) (amount uint) (target-weight uint))
+  (let
+    (
+      (portfolio (unwrap! (map-get? portfolios portfolio-id) err-portfolio-not-found))
+      (offset (unwrap! (map-get? carbon-offsets offset-id) err-not-found))
+      (existing-holding (map-get? portfolio-holdings {portfolio-id: portfolio-id, offset-id: offset-id}))
+      (user-balance (ft-get-balance carbon-credit tx-sender))
+      (current-holdings-count (get-portfolio-holdings-count portfolio-id))
+    )
+    (asserts! (is-eq tx-sender (get owner portfolio)) err-unauthorized)
+    (asserts! (get is-active portfolio) err-portfolio-empty)
+    (asserts! (get validation-status offset) err-not-validated)
+    (asserts! (> amount u0) err-invalid-amount)
+    (asserts! (>= user-balance amount) err-insufficient-balance)
+    (asserts! (and (> target-weight u0) (<= target-weight u10000)) err-invalid-weights)
+    (asserts! (is-none existing-holding) err-duplicate-offset)
+    (asserts! (< current-holdings-count max-portfolio-size) err-portfolio-limit-exceeded)
+    
+    (try! (ft-transfer? carbon-credit amount tx-sender (as-contract tx-sender)))
+    
+    (map-set portfolio-holdings 
+      {portfolio-id: portfolio-id, offset-id: offset-id}
+      {
+        amount: amount,
+        target-weight: target-weight,
+        purchase-price: (get price-per-credit offset),
+        added-at: stacks-block-height
+      }
+    )
+    
+    (map-set portfolios portfolio-id
+      (merge portfolio {
+        total-value: (+ (get total-value portfolio) (* amount (get price-per-credit offset))),
+        last-rebalanced: stacks-block-height
+      })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (batch-retire-from-portfolio (portfolio-id uint) (retirement-list (list 10 {offset-id: uint, amount: uint})))
+  (let
+    (
+      (portfolio (unwrap! (map-get? portfolios portfolio-id) err-portfolio-not-found))
+    )
+    (asserts! (is-eq tx-sender (get owner portfolio)) err-unauthorized)
+    (asserts! (get is-active portfolio) err-portfolio-empty)
+    (asserts! (> (len retirement-list) u0) err-invalid-amount)
+    
+    (try! (fold batch-retire-helper retirement-list (ok portfolio-id)))
+    (ok true)
+  )
+)
+
+(define-public (rebalance-portfolio (portfolio-id uint) (rebalancing-list (list 15 {offset-id: uint, new-target-weight: uint})))
+  (let
+    (
+      (portfolio (unwrap! (map-get? portfolios portfolio-id) err-portfolio-not-found))
+      (total-weight (fold sum-weights rebalancing-list u0))
+    )
+    (asserts! (is-eq tx-sender (get owner portfolio)) err-unauthorized)
+    (asserts! (get is-active portfolio) err-portfolio-empty)
+    (asserts! (is-eq total-weight u10000) err-invalid-weights)
+    (asserts! (> (len rebalancing-list) u0) err-invalid-amount)
+    
+    (try! (fold rebalance-helper rebalancing-list (ok portfolio-id)))
+    
+    (map-set portfolios portfolio-id
+      (merge portfolio {last-rebalanced: stacks-block-height})
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (remove-from-portfolio (portfolio-id uint) (offset-id uint))
+  (let
+    (
+      (portfolio (unwrap! (map-get? portfolios portfolio-id) err-portfolio-not-found))
+      (holding (unwrap! (map-get? portfolio-holdings {portfolio-id: portfolio-id, offset-id: offset-id}) err-not-found))
+    )
+    (asserts! (is-eq tx-sender (get owner portfolio)) err-unauthorized)
+    (asserts! (get is-active portfolio) err-portfolio-empty)
+    
+    (try! (as-contract (ft-transfer? carbon-credit (get amount holding) tx-sender (get owner portfolio))))
+    (map-delete portfolio-holdings {portfolio-id: portfolio-id, offset-id: offset-id})
+    
+    (let
+      (
+        (holding-value (* (get amount holding) (get purchase-price holding)))
+        (new-total-value (if (>= (get total-value portfolio) holding-value)
+                           (- (get total-value portfolio) holding-value)
+                           u0))
+      )
+      (map-set portfolios portfolio-id
+        (merge portfolio {total-value: new-total-value})
+      )
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (deactivate-portfolio (portfolio-id uint))
+  (let
+    (
+      (portfolio (unwrap! (map-get? portfolios portfolio-id) err-portfolio-not-found))
+    )
+    (asserts! (is-eq tx-sender (get owner portfolio)) err-unauthorized)
+    (asserts! (get is-active portfolio) err-portfolio-empty)
+    
+    (map-set portfolios portfolio-id
+      (merge portfolio {is-active: false})
+    )
+    
+    (ok true)
+  )
+)
+
 ;; read only functions
 (define-read-only (get-offset-details (offset-id uint))
   (map-get? carbon-offsets offset-id)
@@ -248,6 +440,46 @@
   contract-owner
 )
 
+(define-read-only (get-portfolio-details (portfolio-id uint))
+  (map-get? portfolios portfolio-id)
+)
+
+(define-read-only (get-portfolio-holding (portfolio-id uint) (offset-id uint))
+  (map-get? portfolio-holdings {portfolio-id: portfolio-id, offset-id: offset-id})
+)
+
+(define-read-only (get-portfolio-performance (portfolio-id uint))
+  (map-get? portfolio-performance portfolio-id)
+)
+
+(define-read-only (get-next-portfolio-id)
+  (var-get next-portfolio-id)
+)
+
+(define-read-only (get-portfolio-holdings-count (portfolio-id uint))
+  (let
+    (
+      (offsets-list (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10 u11 u12 u13 u14 u15 u16 u17 u18 u19 u20))
+      (result (fold count-holdings-helper 
+        (map create-holding-key offsets-list) 
+        {portfolio-id: portfolio-id, count: u0}))
+    )
+    (get count result)
+  )
+)
+
+(define-read-only (calculate-portfolio-value (portfolio-id uint))
+  (let
+    (
+      (offsets-list (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10 u11 u12 u13 u14 u15 u16 u17 u18 u19 u20))
+      (result (fold calculate-value-helper 
+        (map create-holding-key offsets-list) 
+        {portfolio-id: portfolio-id, total-value: u0}))
+    )
+    (get total-value result)
+  )
+)
+
 ;; private functions
 (define-private (is-valid-offset (offset-id uint))
   (match (map-get? carbon-offsets offset-id)
@@ -255,5 +487,83 @@
              (get validation-status offset)
              (< stacks-block-height (get expires-at offset)))
     false
+  )
+)
+
+(define-private (batch-retire-helper (retirement-item {offset-id: uint, amount: uint}) (portfolio-id-result (response uint uint)))
+  (match portfolio-id-result
+    portfolio-id-val
+    (let
+      (
+        (holding (map-get? portfolio-holdings {portfolio-id: portfolio-id-val, offset-id: (get offset-id retirement-item)}))
+      )
+      (match holding
+        holding-data
+        (begin
+          (asserts! (>= (get amount holding-data) (get amount retirement-item)) err-insufficient-balance)
+          (try! (as-contract (ft-burn? carbon-credit (get amount retirement-item) tx-sender)))
+          (if (is-eq (get amount holding-data) (get amount retirement-item))
+            (map-delete portfolio-holdings {portfolio-id: portfolio-id-val, offset-id: (get offset-id retirement-item)})
+            (map-set portfolio-holdings {portfolio-id: portfolio-id-val, offset-id: (get offset-id retirement-item)}
+              (merge holding-data {amount: (- (get amount holding-data) (get amount retirement-item))})))
+          (ok portfolio-id-val))
+        err-not-found))
+    error-val
+    (err error-val))
+)
+
+(define-private (sum-weights (weight-item {offset-id: uint, new-target-weight: uint}) (total uint))
+  (+ total (get new-target-weight weight-item))
+)
+
+(define-private (rebalance-helper (rebalance-item {offset-id: uint, new-target-weight: uint}) (portfolio-id-result (response uint uint)))
+  (match portfolio-id-result
+    portfolio-id-val
+    (let
+      (
+        (holding (map-get? portfolio-holdings {portfolio-id: portfolio-id-val, offset-id: (get offset-id rebalance-item)}))
+      )
+      (match holding
+        holding-data
+        (begin
+          (map-set portfolio-holdings {portfolio-id: portfolio-id-val, offset-id: (get offset-id rebalance-item)}
+            (merge holding-data {target-weight: (get new-target-weight rebalance-item)}))
+          (ok portfolio-id-val))
+        err-not-found))
+    error-val
+    (err error-val))
+)
+
+(define-private (create-holding-key (offset-id uint))
+  offset-id
+)
+
+(define-private (count-holdings-helper (offset-id uint) (acc {portfolio-id: uint, count: uint}))
+  (let
+    (
+      (holding (map-get? portfolio-holdings {portfolio-id: (get portfolio-id acc), offset-id: offset-id}))
+    )
+    (if (is-some holding)
+      {portfolio-id: (get portfolio-id acc), count: (+ (get count acc) u1)}
+      acc)
+  )
+)
+
+(define-private (calculate-value-helper (offset-id uint) (acc {portfolio-id: uint, total-value: uint}))
+  (let
+    (
+      (holding (map-get? portfolio-holdings {portfolio-id: (get portfolio-id acc), offset-id: offset-id}))
+      (offset (map-get? carbon-offsets offset-id))
+    )
+    (match holding
+      holding-data
+      (match offset
+        offset-data
+        {
+          portfolio-id: (get portfolio-id acc),
+          total-value: (+ (get total-value acc) (* (get amount holding-data) (get price-per-credit offset-data)))
+        }
+        acc)
+      acc)
   )
 )
