@@ -29,13 +29,20 @@
 (define-constant err-duplicate-offset (err u111))
 (define-constant err-portfolio-empty (err u112))
 (define-constant err-invalid-weights (err u113))
+(define-constant err-subscription-not-found (err u114))
+(define-constant err-subscription-inactive (err u115))
+(define-constant err-insufficient-balance-subscription (err u116))
+(define-constant err-invalid-frequency (err u117))
+(define-constant err-subscription-expired (err u118))
 (define-constant max-portfolio-size u20)
+(define-constant max-subscription-targets u10)
 
 ;; data vars
 (define-data-var next-offset-id uint u1)
 (define-data-var oracle-address (optional principal) none)
 (define-data-var platform-fee-rate uint u250)
 (define-data-var next-portfolio-id uint u1)
+(define-data-var next-subscription-id uint u1)
 
 ;; data maps
 (define-map carbon-offsets
@@ -102,6 +109,39 @@
     current-value: uint,
     total-retired: uint,
     diversification-score: uint
+  }
+)
+
+(define-map subscriptions
+  uint
+  {
+    subscriber: principal,
+    budget-per-period: uint,
+    frequency-blocks: uint,
+    next-execution: uint,
+    auto-retire: bool,
+    is-active: bool,
+    created-at: uint,
+    total-spent: uint,
+    executions-count: uint
+  }
+)
+
+(define-map subscription-targets
+  {subscription-id: uint, target-index: uint}
+  {
+    offset-id: uint,
+    allocation-percentage: uint
+  }
+)
+
+(define-map subscription-history
+  {subscription-id: uint, execution-id: uint}
+  {
+    executed-at: uint,
+    amount-spent: uint,
+    credits-purchased: uint,
+    credits-retired: uint
   }
 )
 
@@ -407,6 +447,151 @@
   )
 )
 
+(define-public (create-subscription (budget-per-period uint) (frequency-blocks uint) (auto-retire bool) (target-allocations (list 10 {offset-id: uint, allocation-percentage: uint})))
+  (let
+    (
+      (subscription-id (var-get next-subscription-id))
+      (current-height stacks-block-height)
+      (total-allocation (fold sum-allocations target-allocations u0))
+    )
+    (asserts! (> budget-per-period u0) err-invalid-amount)
+    (asserts! (> frequency-blocks u0) err-invalid-frequency)
+    (asserts! (is-eq total-allocation u10000) err-invalid-weights)
+    (asserts! (> (len target-allocations) u0) err-invalid-amount)
+    (asserts! (<= (len target-allocations) max-subscription-targets) err-portfolio-limit-exceeded)
+    
+    (try! (fold validate-subscription-targets target-allocations (ok u0)))
+    
+    (map-set subscriptions subscription-id
+      {
+        subscriber: tx-sender,
+        budget-per-period: budget-per-period,
+        frequency-blocks: frequency-blocks,
+        next-execution: (+ current-height frequency-blocks),
+        auto-retire: auto-retire,
+        is-active: true,
+        created-at: current-height,
+        total-spent: u0,
+        executions-count: u0
+      }
+    )
+    
+    (fold set-subscription-targets-indexed
+      target-allocations
+      {subscription-id: subscription-id, current-index: u0})
+    
+    (var-set next-subscription-id (+ subscription-id u1))
+    (ok subscription-id)
+  )
+)
+
+(define-public (execute-subscription (subscription-id uint))
+  (let
+    (
+      (subscription (unwrap! (map-get? subscriptions subscription-id) err-subscription-not-found))
+      (current-height stacks-block-height)
+      (execution-id (get executions-count subscription))
+    )
+    (asserts! (get is-active subscription) err-subscription-inactive)
+    (asserts! (>= current-height (get next-execution subscription)) err-invalid-amount)
+    (asserts! (>= (stx-get-balance tx-sender) (get budget-per-period subscription)) err-insufficient-balance-subscription)
+    
+    (let
+      (
+        (target-indices (list u0 u1 u2 u3 u4 u5 u6 u7 u8 u9))
+        (purchase-result (fold execute-subscription-purchase 
+          target-indices 
+          {subscription-id: subscription-id, total-purchased: u0, total-spent: u0, total-retired: u0}))
+      )
+      (map-set subscriptions subscription-id
+        (merge subscription {
+          next-execution: (+ current-height (get frequency-blocks subscription)),
+          total-spent: (+ (get total-spent subscription) (get total-spent purchase-result)),
+          executions-count: (+ execution-id u1)
+        })
+      )
+      
+      (map-set subscription-history 
+        {subscription-id: subscription-id, execution-id: execution-id}
+        {
+          executed-at: current-height,
+          amount-spent: (get total-spent purchase-result),
+          credits-purchased: (get total-purchased purchase-result),
+          credits-retired: (get total-retired purchase-result)
+        }
+      )
+      
+      (ok true)
+    )
+  )
+)
+
+(define-public (pause-subscription (subscription-id uint))
+  (let
+    (
+      (subscription (unwrap! (map-get? subscriptions subscription-id) err-subscription-not-found))
+    )
+    (asserts! (is-eq tx-sender (get subscriber subscription)) err-unauthorized)
+    (asserts! (get is-active subscription) err-subscription-inactive)
+    
+    (map-set subscriptions subscription-id
+      (merge subscription {is-active: false})
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (resume-subscription (subscription-id uint))
+  (let
+    (
+      (subscription (unwrap! (map-get? subscriptions subscription-id) err-subscription-not-found))
+    )
+    (asserts! (is-eq tx-sender (get subscriber subscription)) err-unauthorized)
+    (asserts! (not (get is-active subscription)) err-invalid-amount)
+    
+    (map-set subscriptions subscription-id
+      (merge subscription {
+        is-active: true,
+        next-execution: (+ stacks-block-height (get frequency-blocks subscription))
+      })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (update-subscription-budget (subscription-id uint) (new-budget uint))
+  (let
+    (
+      (subscription (unwrap! (map-get? subscriptions subscription-id) err-subscription-not-found))
+    )
+    (asserts! (is-eq tx-sender (get subscriber subscription)) err-unauthorized)
+    (asserts! (> new-budget u0) err-invalid-amount)
+    
+    (map-set subscriptions subscription-id
+      (merge subscription {budget-per-period: new-budget})
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (cancel-subscription (subscription-id uint))
+  (let
+    (
+      (subscription (unwrap! (map-get? subscriptions subscription-id) err-subscription-not-found))
+    )
+    (asserts! (is-eq tx-sender (get subscriber subscription)) err-unauthorized)
+    
+    (map-set subscriptions subscription-id
+      (merge subscription {is-active: false})
+    )
+    
+    (ok true)
+  )
+)
+
 ;; read only functions
 (define-read-only (get-offset-details (offset-id uint))
   (map-get? carbon-offsets offset-id)
@@ -478,6 +663,31 @@
     )
     (get total-value result)
   )
+)
+
+(define-read-only (get-subscription-details (subscription-id uint))
+  (map-get? subscriptions subscription-id)
+)
+
+(define-read-only (get-subscription-target (subscription-id uint) (target-index uint))
+  (map-get? subscription-targets {subscription-id: subscription-id, target-index: target-index})
+)
+
+(define-read-only (get-subscription-history (subscription-id uint) (execution-id uint))
+  (map-get? subscription-history {subscription-id: subscription-id, execution-id: execution-id})
+)
+
+(define-read-only (get-next-subscription-id)
+  (var-get next-subscription-id)
+)
+
+(define-read-only (is-subscription-ready (subscription-id uint))
+  (match (map-get? subscriptions subscription-id)
+    subscription
+    (and 
+      (get is-active subscription)
+      (>= stacks-block-height (get next-execution subscription)))
+    false)
 )
 
 ;; private functions
@@ -567,3 +777,76 @@
       acc)
   )
 )
+
+(define-private (sum-allocations (allocation {offset-id: uint, allocation-percentage: uint}) (total uint))
+  (+ total (get allocation-percentage allocation))
+)
+
+(define-private (validate-subscription-targets (target {offset-id: uint, allocation-percentage: uint}) (result (response uint uint)))
+  (match result
+    success-val
+    (let
+      (
+        (offset (map-get? carbon-offsets (get offset-id target)))
+      )
+      (match offset
+        offset-data
+        (if (get validation-status offset-data)
+          (ok success-val)
+          err-not-validated)
+        err-not-found))
+    error-val
+    (err error-val))
+)
+
+(define-private (set-subscription-targets-indexed (target {offset-id: uint, allocation-percentage: uint}) (acc {subscription-id: uint, current-index: uint}))
+  (begin
+    (map-set subscription-targets 
+      {subscription-id: (get subscription-id acc), target-index: (get current-index acc)}
+      {
+        offset-id: (get offset-id target),
+        allocation-percentage: (get allocation-percentage target)
+      })
+    {subscription-id: (get subscription-id acc), current-index: (+ (get current-index acc) u1)})
+)
+
+(define-private (execute-subscription-purchase (target-index uint) (acc {subscription-id: uint, total-purchased: uint, total-spent: uint, total-retired: uint}))
+  (let
+    (
+      (subscription-id (get subscription-id acc))
+      (subscription (unwrap-panic (map-get? subscriptions subscription-id)))
+      (target (map-get? subscription-targets {subscription-id: subscription-id, target-index: target-index}))
+    )
+    (match target
+      target-data
+      (let
+        (
+          (allocation-amount (/ (* (get budget-per-period subscription) (get allocation-percentage target-data)) u10000))
+          (offset (unwrap-panic (map-get? carbon-offsets (get offset-id target-data))))
+          (credits-to-buy (/ allocation-amount (get price-per-credit offset)))
+        )
+        (if (> credits-to-buy u0)
+          (let
+            (
+              (actual-cost (* credits-to-buy (get price-per-credit offset)))
+              (retired-amount (if (get auto-retire subscription) credits-to-buy u0))
+            )
+            (if (get auto-retire subscription)
+              {
+                subscription-id: subscription-id,
+                total-purchased: (+ (get total-purchased acc) credits-to-buy),
+                total-spent: (+ (get total-spent acc) actual-cost),
+                total-retired: (+ (get total-retired acc) retired-amount)
+              }
+              {
+                subscription-id: subscription-id,
+                total-purchased: (+ (get total-purchased acc) credits-to-buy),
+                total-spent: (+ (get total-spent acc) actual-cost),
+                total-retired: (get total-retired acc)
+              }))
+          acc))
+      acc)
+  )
+)
+
+
